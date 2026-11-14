@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup><Compile Include="../../Y51_SE2Online/Y51_SE2Online/Sync/PlayoutClock.cs" Link="PlayoutClock.cs" /></ItemGroup>
+</Project>

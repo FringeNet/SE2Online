@@ -158,7 +158,6 @@ public sealed class MpPlugin : IPlugin, IDisposable
 		Optional("shared discoveries", () => SharedDiscoveries.Install(_harmony));
 		Optional("research, contract and progression sharing", () => ProgressionSharing.Install(_harmony));
 		Optional("motion playback", () => MotionSmoothing.Install(_harmony));
-		Optional("VSync held on", () => KeenNetcode.ForceVSync.Install(_harmony));
 		Optional("motion trace", () => KeenNetcode.MotionTrace.Install(_harmony));
 		Optional("flora collider recovery", () => KeenNetcode.FloraPhysicsRecovery.Install(_harmony));
 #if !PULSAR

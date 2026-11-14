@@ -6,9 +6,9 @@ namespace Y51_SE2Online.Sync;
 
 /// <summary>
 /// A joined player's playback clock for everything the server moves (other players, grids, the ship this player pilots).
-/// Times are server game time in TimeSpan ticks; the clock steps once per client tick (game time is ticks/60 on both
-/// sides, so a step is the server time one client tick covers: 1/60 s when both run 60 ticks a second, less on a slower
-/// server). The game's own clock chased the newest sample's time (10% nudges, a delay of one sample gap minus a frame), so
+/// Times are server game time in TimeSpan ticks. Each steady client tick covers the measured server rate times the
+/// recent four-tick wall cadence; a stall and its catch-up ticks retain nominal tick pacing. The game's own clock
+/// chased the newest sample's time (10% nudges, a delay of one sample gap minus a frame), so
 /// every late or bunched packet sped it up or slowed it down and its delay flipped with the gap between the last two
 /// samples: remote bodies stepped back and forth, and a ship's deck slid under the feet of a predicted character.
 /// This one runs at the measured server rate and a delay sized from how late samples really arrive: the newest server
@@ -45,10 +45,10 @@ public sealed class PlayoutClock
 	/// back-to-back ticks after it as late, and a stall on the server's side as a pause and a burst whose every quiet tick
 	/// was late: the 98th percentile sat at the 300 ms maximum, the target ran past the newest sample, and the clock held
 	/// and jumped (a joined game on the same PC as its host: 352 catch-ups, 642 held ticks, 1514 blends in a minute). Now:
-	/// a tick 0.5-2 frames after the last is steady; only steady ticks bringing a sample at most 3 frames past the newest
+	/// a recent cadence of 0.25-4 nominal frames is steady; only steady ticks bringing a sample at most 3 frames past the newest
 	/// record a lead and a lateness (one per arrival, no quiet ticks); ticks off that just play on at the rate; after a jump
 	/// or a stall the leads start over and the next arrival is not measured. The rate is server time per wall second over
-	/// 1.5 s between steady arrivals (stalls and bursts between them), exactly one frame a tick within 3%.
+	/// 1.5 s between steady arrivals (stalls and bursts between them), exactly one nominal frame within 3%.
 	/// </summary>
 	public bool Wall = true;
 
@@ -94,8 +94,11 @@ public sealed class PlayoutClock
 	/// over a frame step, else the clock) land on <paramref name="cursor"/>.</summary>
 	public static long CadenceFor(long clock, long cursor, long step) => Math.Max(0, clock - cursor) + step;
 
-	/// <summary>Server time per client tick (TimeSpan ticks).</summary>
+	/// <summary>Server time per nominal 1/60 wall second (TimeSpan ticks).</summary>
 	public double Rate => _rate;
+
+	/// <summary>Expected server time per client tick, using the recent wall cadence and the physical per-tick cap.</summary>
+	public double Step { get; private set; } = Frame;
 
 	/// <summary>How far behind the newest expected sample the cursor plays (TimeSpan ticks).</summary>
 	public double Delay => _delay;
@@ -115,6 +118,8 @@ public sealed class PlayoutClock
 		_primed = false;
 		_pendingNewest = long.MinValue;
 		_rate = Frame;
+		Step = Frame;
+		_easing = false;
 		_rateServer = _rateTicks = 0;
 		_delay = Frame;
 		_lateCount = _lateAt = 0;
@@ -154,15 +159,14 @@ public sealed class PlayoutClock
 			gap = double.IsNaN(_lastWallMs) ? 1 : Math.Max(0, (wallMs - _lastWallMs) / FrameMs);
 			_lastWallMs = wallMs;
 		}
-		// Steady: the last four ticks average 0.5-2 frames apart (under 30 frames a second ticks come in pairs, one right on
-		// the other: steady too); a stall and the back-to-back ticks after it are not.
+		// Cover ordinary tick rates and pacing jitter; a stall and the back-to-back ticks after it are not steady.
 		_gaps[_gapAt] = gap;
 		_gapAt = (_gapAt + 1) % _gaps.Length;
 		if (_gapCount < _gaps.Length) _gapCount++;
 		double meanGap = 0;
 		for (int i = 0; i < _gapCount; i++) meanGap += _gaps[i];
 		meanGap /= _gapCount;
-		bool steady = !wall || meanGap >= 0.5 && meanGap <= 2 && gap <= 4;
+		bool steady = !wall || meanGap >= 0.25 - 1e-6 && meanGap <= 4 + 1e-6 && gap <= 4 + 1e-6;
 		bool jumped = false, heldAtCap = false;
 		_expected += wall ? _rate * Math.Min(gap, 600) : _rate;
 		if (_beat)
@@ -251,6 +255,7 @@ public sealed class PlayoutClock
 			}
 		}
 		if (!_primed) return 0;
+		Step = Math.Min(_rate * (wall && steady ? meanGap : 1), StepCap);
 
 		// The pair for the next tick is picked now, from what is here now: the next tick's cursor must not pass the newest
 		// sample. How far that newest sample is behind the line is measured every tick (a tick that brought nothing counts).
@@ -271,14 +276,14 @@ public sealed class PlayoutClock
 		// the difference a tick (about 2.3 s to halve it).
 		_delay = wanted > _delay ? Math.Min(wanted, _delay + Frame) : _delay - (_delay - wanted) * 0.005;
 		double target = line - _delay;
-		double error = target - (_play + _rate);
+		double error = target - (_play + Step);
 		double next;
 		// Wall-clocked with no lead in the window yet (just after a jump or a stall): no line to steer by.
 		if (!steady || wall && !HaveLine(tick))
 		{
 			// A tick right on the last one (the game catching up after a stall) or long after it: the wall-clocked line
 			// says nothing a steady tick would; play on at the rate.
-			next = _play + _rate;
+			next = _play + Step;
 			goto Capped;
 		}
 		// The line moves in steps (an early packet enters or leaves the window): the error is filtered over half a second
@@ -289,7 +294,7 @@ public sealed class PlayoutClock
 		if (error <= JumpBehind) _easing = false;
 		else if (!double.IsPositiveInfinity(StepCap)) _easing = true;
 		// Easing goes on until caught up even when the cap is lifted (the deck slowed or was left): no jump meanwhile.
-		bool capped = _easing && error < 10 * JumpBehind;
+		bool capped = _easing;
 		if (error > JumpBehind && !capped)
 		{
 			next = target;
@@ -298,8 +303,7 @@ public sealed class PlayoutClock
 			jumped = true;
 			if (wall) { Array.Clear(_bucketTick); _skipNextArrival = true; }
 		}
-		else next = _play + _rate * (1 + Math.Clamp((error > JumpBehind ? error : _error) / Second, -MaxNudge, MaxNudge));
-		if (capped && next - _play > StepCap) next = _play + StepCap;
+		else next = _play + Step * (1 + Math.Clamp((error > JumpBehind ? error : _error) / Second, -MaxNudge, MaxNudge));
 		// While the stream pauses: no further than the game extrapolates (two of its usual steps past the newest sample), so nothing stands at its
 		// extrapolation limit and then jumps back when the stream resumes.
 		// Not while frames keep coming but no sample has for a while: the server runs and nothing it moves changed, and
@@ -307,7 +311,7 @@ public sealed class PlayoutClock
 		// host: 314 catch-ups and 451 held ticks a minute). While samples flow, or nothing at all comes (a stall, a cut),
 		// it holds as before. Each body still stops at the end of its own extrapolation (PlayoutTrack).
 		Capped:
-		if (!steady && next - _play > StepCap) next = _play + StepCap;
+		if (next - _play > StepCap) next = _play + StepCap;
 		double cap = _newest + Math.Max(MaxLead, 2 * _newestStep);
 		bool idleWorld = !LegacyCap && tick - _newestTick > QuietTicks && tick - _beatTick <= Math.Max(BeatTicks, Math.Min(StallTicks, 2 * _beatGap));
 		if (!idleWorld && next > cap) { next = Math.Max(_play, cap); Held++; heldAtCap = true; }

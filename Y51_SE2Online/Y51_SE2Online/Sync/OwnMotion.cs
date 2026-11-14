@@ -407,8 +407,8 @@ public sealed class OwnInputBuffer
 		}
 		else
 		{
-			// Holding a key is the likely case; after a few ticks with nothing the player is let go of, not run off a cliff.
-			input = _guessRun++ < GuessTicks ? _last with { Jump = false, Toggles = OwnToggles.None } : new OwnInput(default, default, false, _last.Sprint, _last.Boost);
+			// Hold movement and roll keys briefly, but do not repeat per-tick mouse pitch/yaw deltas.
+			input = _guessRun++ < GuessTicks ? _last with { Rotation = new Vector3(0, 0, _last.Rotation.Z), Jump = false, Toggles = OwnToggles.None } : new OwnInput(default, default, false, _last.Sprint, _last.Boost);
 			_guessed[_next] = input;
 			_guessed.Remove(_next - Window);
 			Guessed++;

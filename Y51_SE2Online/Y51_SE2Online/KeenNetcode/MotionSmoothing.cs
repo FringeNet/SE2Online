@@ -242,7 +242,7 @@ internal static class MotionSmoothing
 				HostClock.Arrive(time);
 			}
 			if (!HostClock.Primed) return false;
-			double cursor = track.Cursor(HostClock.Play, _hostStep, HostClock.Rate);
+			double cursor = track.Cursor(HostClock.Play, _hostStep, HostClock.Step);
 			if (!track.Pick(ref cursor, out var previous, out var next, out _, out _)) return false;
 			history.Previous = previous;
 			history.Newest = next;
@@ -267,7 +267,7 @@ internal static class MotionSmoothing
 			double was = HostClock.Play;
 			bool primed = HostClock.Primed;
 			HostClock.Advance(Wall.Elapsed.TotalMilliseconds);
-			_hostStep = primed ? HostClock.Play - was : HostClock.Rate;
+			_hostStep = primed ? HostClock.Play - was : HostClock.Step;
 			foreach (var gone in HostTracks.Keys.Where(d => !session.Scene.IsEntityAlive(d)).ToList()) HostTracks.Remove(gone);
 		}
 	}
@@ -428,7 +428,9 @@ internal static class MotionSmoothing
 			// 2% more than one server tick.
 			float deckSpeed = Deck is { } onDeck && !Dead(onDeck) && onDeck.Data.TryGet<Keen.VRage.Physics.Data.RigidBodyData>(out var deckBody) ? deckBody.LinearVelocity.Length() : 0;
 			_fastDeck = deckSpeed > (_fastDeck ? FastDeckOff : FastDeck);
-			Clock.StepCap = _fastDeck ? Sync.PlayoutClock.Frame * (1 + FastDeckNudge) : double.PositiveInfinity;
+			double physicsStep = session.SessionComponents.TryGet<Keen.VRage.Physics.Havok.HavokSessionComponent>() is { StepDelta: > 0 } havok
+				? havok.StepDelta * Sync.PlayoutClock.Second : Sync.PlayoutClock.Frame;
+			Clock.StepCap = _fastDeck ? physicsStep * (1 + FastDeckNudge) : double.PositiveInfinity;
 			double play = Clock.Advance(WallOff ? double.NaN : Wall.Elapsed.TotalMilliseconds);
 			if (!Clock.Primed) return;
 			if (MotionTrace.Recording)
@@ -437,10 +439,10 @@ internal static class MotionSmoothing
 				MotionTrace.Note("clock", "clock", FormattableString.Invariant($"gap={t.GapFrames:0.00} steady={(t.Steady ? 1 : 0)} play={play:0} expected={Clock.Expected:0} line={t.Line:0} newest={Clock.Newest} delay={Clock.Delay / 1e4:0.0} jitter={Clock.Jitter / 1e4:0.0} rate={Clock.Rate / Sync.PlayoutClock.Frame:0.000} error={t.Error / 1e4:0.0} jumped={(t.Jumped ? 1 : 0)} held={(t.HeldAtCap ? 1 : 0)} pending={(Clock.Newest - play) / Sync.PlayoutClock.Frame:0.00}"));
 			}
 			long clock = (long)play;
-			long step = Math.Max(1, (long)Clock.Rate);
-			double moved = primed ? play - was : Clock.Rate;
-			// k: server time per client time; a body's velocity moves it that much faster or slower here.
-			float k = PlayoutRateOff ? 1f : (float)Math.Clamp(Clock.Rate / Sync.PlayoutClock.Frame, 0.5, 2.0);
+			long step = Math.Max(1, (long)Clock.Step);
+			double moved = primed ? play - was : Clock.Step;
+			// A body's velocity covers this tick's server time during one local physics step.
+			float k = PlayoutRateOff ? 1f : (float)Math.Clamp(Clock.Step / physicsStep, 0, 2.0);
 			List<Entity>? gone = null, dropped = null;
 			var deck = Deck;
 			_deckNextValid = false;
@@ -464,7 +466,7 @@ internal static class MotionSmoothing
 					// ahead of the held clock (its samples are written that much earlier, so the game's cursor finds it there).
 					track.LongExtrapolation = isDeck && deckSpeed > 1 ? DeckLead : 0;
 					track.CursorStepCap = isDeck ? Clock.StepCap : double.PositiveInfinity;
-					double cursor = track.Cursor(play, moved, Clock.Rate);
+					double cursor = track.Cursor(play, moved, Clock.Step);
 					if (!track.Pick(ref cursor, out var previous, out var next, out bool extrapolating, out var blend)) continue;
 					if (MotionTrace.Recording) MotionTrace.Play(entity, (long)cursor, previous.ServerTime.Ticks, next.ServerTime.Ticks, extrapolating, track.Lead, Clock.Newest);
 					if (extrapolating) PlayoutHolds++;

@@ -47,35 +47,7 @@ internal static class OwnMotion
 	private static readonly System.Reflection.FieldInfo PhysicsDefinition = AccessTools.Field(typeof(Keen.VRage.Physics.Components.CharacterPhysicsComponent), "CharacterPhysicsDefinition");
 
 	private const double TickSeconds = 1 / 60.0;
-
-	// -y51online:tickpace:off: this game does not offer to skip ticks; the server merges inputs as before.
 	private static readonly bool TickPaceOff = System.Linq.Enumerable.Contains(MpPlugin.LaunchArgs, MpOptions.Prefix + "tickpace:off");
-	private static readonly SkipPlanner Pace = new();
-	private static Frozen? _skipFrozen;
-
-	// What a skipped tick would look like now (Sync.SkipPlanner decides): standing (no input, slower than 1.5 m/s),
-	// walking (on the ground, under 7 m/s), or blocked (boosting, charging the boost, a jump due, on a moving body).
-	private static (bool Standing, bool Walking, bool Blocked) SkipConditions(Entity own)
-	{
-		if (_jumpPending || !own.Data.TryGet<RigidBodyData>(out var body)) return (false, false, true);
-		bool blocked = own.Data.TryGet<CharacterMovementComponent.JetpackModeData>(out var jet) && jet.IsBoosting
-			|| own.Data.TryGet<AdvancedCharacterControlData>(out var flags) && flags.IsBoosting;
-		if (Parent(own) is { } under && !EngineCodec.IsDead(under) && under.Data.Has<DynamicTag>())
-		{
-			under.Data.TryGet<RigidBodyData>(out var deck);
-			blocked |= !SkipPlanner.FrameAllows(true, deck.LinearVelocity.Length(), deck.AngularVelocity.Length());
-		}
-		own.Data.TryGet<ControlData>(out var control);
-		float speed = RelativeSpeed(own, body);
-		bool standing = control.Movement == Vector3.Zero && control.Rotation == Vector3.Zero && speed < 1.5f;
-		var state = own.TryGet<CharacterMovementComponent>()?.CurrentMovementState;
-		// A jetpack under 3 m/s too (-y51online:jetskip:off: on the ground only): flying, a 55-58 ticks/s server asked 66
-		// skips a minute and got 6, and drained the rest of its queue by merging two inputs into a tick.
-		bool walking = state == CharacterMovementState.Ground && speed < 7f || !JetSkipOff && state == CharacterMovementState.Jetpack && speed < 3f;
-		return (standing, walking, blocked);
-	}
-
-	private static readonly bool JetSkipOff = System.Linq.Enumerable.Contains(MpPlugin.LaunchArgs, MpOptions.Prefix + "jetskip:off");
 
 	// A stall of this game (0.2-1.3 s a few times a minute: an autosave, a GC) is followed by the missed ticks back to
 	// back. Each of them predicted the character and sent an input: about 36 inputs in 100 ms after a 0.6 s stall, over the
@@ -85,6 +57,7 @@ internal static class OwnMotion
 	private static readonly bool CatchUpFreezeOff = !System.Linq.Enumerable.Contains(MpPlugin.LaunchArgs, MpOptions.Prefix + "catchupfreeze:on");
 	private static readonly System.Diagnostics.Stopwatch TickWall = System.Diagnostics.Stopwatch.StartNew();
 	private static readonly CatchUpDetector CatchUp = new();
+	private static Frozen? _catchUpFrozen;
 	internal static long CatchUpHeld;
 	private static long _inputsThisSecond, _inputSecondMs, _catchUpAtSecond, _serverTicksSecond, _serverCatchUps, _serverSecondMs;
 
@@ -179,12 +152,13 @@ internal static class OwnMotion
 	internal static void ResetClient()
 	{
 		_driving = false;
+		_groundYaw = 0f;
 		_ownEntity = null;
 		_correctedFor = null;
 		_clientIds = null;
 		_idsSession = null;
 		_boundTo = null;
-		_skipFrozen = null;
+		_catchUpFrozen = null;
 		_deckWas = null;
 		MotionSmoothing.Deck = null;
 		lock (HeldFrames) HeldFrames.Clear();
@@ -304,6 +278,7 @@ internal static class OwnMotion
 		bool catchUp = CatchingUp();
 		// Taken (or not) by the physics step that just ran.
 		_softShiftPending = false;
+		_groundYaw = 0f;
 		var client = NetSession.Current?.Client;
 		if (!ReferenceEquals(client, _boundTo))
 		{
@@ -313,8 +288,7 @@ internal static class OwnMotion
 			_ackedMs = MpClock.NowMs();
 			_answered = false;
 			_serverStates = false;
-			Pace.Reset();
-			_skipFrozen = null;
+			_catchUpFrozen = null;
 			Recent.Clear();
 			Correction.Reset();
 			StateCheck.Reset();
@@ -345,17 +319,13 @@ internal static class OwnMotion
 		while (OwnMotionInbox.Poses.TryDequeue(out var pose))
 		{
 			if (pose.State is byte flagged && (flagged & OwnState.Skip) != 0)
-			{
 				pose = pose with { State = (byte)(flagged & ~OwnState.Skip) };
-				if (!TickPaceOff) Pace.Ask(MpClock.NowMs());
-			}
 			if (pose.State.HasValue && !OwnStatePrediction.Off) _serverStates = true;
 			if (OwnPose.NewerEpoch(pose.Epoch, _epoch))
 			{
 				_epoch = pose.Epoch;
 				ack = null;
-				Pace.Reset();
-				_skipFrozen = null;
+				_catchUpFrozen = null;
 				_vanillaUntilMs = 0;
 				_ackedMs = MpClock.NowMs();
 				_answered = false;
@@ -448,32 +418,19 @@ internal static class OwnMotion
 
 		if (catchUp)
 		{
-			// Held where it is on what it stands on until the catch-up is over (Freeze/Thaw as for a skipped tick).
-			if (_skipFrozen is { } kept) Thaw(own, kept);
-			else _skipFrozen = Freeze(own);
+			// The optional catch-up freeze holds the character in its current supporting frame.
+			if (_catchUpFrozen is { } kept) Thaw(own, kept);
+			else _catchUpFrozen = Freeze(own);
 			var under = Parent(own) is { } deckUnder && !EngineCodec.IsDead(deckUnder) ? PointVelocity(deckUnder, own.Data.GetWorldTransform().Position) : Vector3.Zero;
 			if (own.Data.TryGet<RigidBodyData>(out var holding)) own.Data.Set(new RigidBodyData(under, holding.AngularVelocity));
 			CatchUpHeld++;
 			if (MotionTrace.Recording) MotionTrace.Own(own, "catchup", own.Data.GetWorldTransform(), under, "held, no input");
 			return;
 		}
-		if (_skipFrozen is { } held)
+		if (_catchUpFrozen is { } held)
 		{
-			_skipFrozen = null;
+			_catchUpFrozen = null;
 			Thaw(own, held);
-		}
-		else if (Pace.Wanted > 0 && SkipConditions(own) is var (standing, walking, blocked) && Pace.TryTake(standing, walking, blocked, _seq + 1, now))
-		{
-			// The server ticks slower than this game: one of its ticks is left out here (the character holds still, no
-			// input is made) instead of the server merging two inputs into one tick, which costs a tick of travel.
-			// Held by its velocity only: the player's ControlData (keys held) is left alone, and the frozen pose and
-			// velocity are put back on the next tick.
-			_skipFrozen = Freeze(own);
-			if (MotionTrace.Recording) MotionTrace.Own(own, "freeze", own.Data.GetWorldTransform(), Vector3.Zero, "tick skipped for the server");
-			// Still relative to what it stands on (at rest when a skip is allowed, SkipConditions), not to the world.
-			var still = Parent(own) is { } under && !EngineCodec.IsDead(under) && under.Data.TryGet<RigidBodyData>(out var deck) ? deck.LinearVelocity : Vector3.Zero;
-			if (own.Data.TryGet<RigidBodyData>(out var moving)) own.Data.Set(new RigidBodyData(still, moving.AngularVelocity));
-			return;
 		}
 		var input = InputOf(own);
 		var (parent, frame) = FrameOf(own, ids);
@@ -497,7 +454,7 @@ internal static class OwnMotion
 		_ownAt = own.Data.GetWorldTransform().Position;
 		Recent.Insert(0, input);
 		if (Recent.Count > OwnInputs.Redundancy) Recent.RemoveAt(Recent.Count - 1);
-		client.SendOwnInputs(OwnInputs.Encode(_epoch, _seq, Recent, toggles: !OwnStatePrediction.Off, paced: !TickPaceOff && !OwnStatePrediction.Off));
+		client.SendOwnInputs(OwnInputs.Encode(_epoch, _seq, Recent, toggles: !OwnStatePrediction.Off));
 		if (MotionTrace.Recording)
 		{
 			_inputsThisSecond++;
@@ -518,7 +475,7 @@ internal static class OwnMotion
 		if (now - _statsLogMs >= 30000)
 		{
 			_statsLogMs = now;
-			GameLog.Instance.Info($"own motion: {DescribeCorrection()}; {OwnStatePrediction.Stats}{(_serverStates ? "" : " (the server does not take toggles from inputs)")}; {Pace.Taken} ticks skipped for the server ({Pace.Asked} asked); carried with the deck {DeckCarried} ticks (largest speed change {DeckCarryMax:0.0} m/s), {Correction.DeckVelocityKept} deck velocity corrections left out");
+			GameLog.Instance.Info($"own motion: {DescribeCorrection()}; {OwnStatePrediction.Stats}{(_serverStates ? "" : " (the server does not take toggles from inputs)")}; carried with the deck {DeckCarried} ticks (largest speed change {DeckCarryMax:0.0} m/s), {Correction.DeckVelocityKept} deck velocity corrections left out");
 		}
 	}
 
