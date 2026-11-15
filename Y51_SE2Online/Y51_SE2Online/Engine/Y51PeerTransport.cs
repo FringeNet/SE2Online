@@ -665,50 +665,78 @@ internal abstract class Y51PeerTransport : IPeerTransport, IDisposable, EngineWi
 
 	// --- inbound ---
 
-	// What a player may have the server hold for it before the scene thread reads it: frames that came early (out of
-	// sequence) and frames waiting to be read, by count and by bytes. A player past either is disconnected.
+	// Bound both early frames and ready scene work. Guests allow two maximum-sized host Bulk messages;
+	// client input retains the server's smaller limits. An ordered stream past a limit must end, never lose a frame.
 	private const int MaxEarlyFramesFromClient = 1024;
 	private const long MaxPendingBytesFromClient = 64L << 20;
+	internal const int MaxPendingFramesFromHost = 100_000;
+	internal const long MaxPendingBytesFromHost = 512L << 20;
+	// A full 256 MiB Bulk frame at 1 MiB/s may arrive after later Control frames; never skip its stream sequence.
+	internal const long WorldGapTimeoutMs = 300_000;
+	private readonly object _inboundGate = new();
 	private long _pendingBytes;
 	private volatile bool _overflowed;
+	private string? _inboundFailure;
 
-	/// <summary>Network thread. False when the peer sent more than the server holds for one player (disconnect it).</summary>
+	internal string? InboundFailure => System.Threading.Volatile.Read(ref _inboundFailure);
+
+	internal string? CheckInboundFailure(long nowMs)
+	{
+		lock (_inboundGate)
+		{
+			if (_inboundFailure == null && _frames.TryGetExpiredGap(nowMs, WorldGapTimeoutMs, out uint sequence))
+				FailInbound($"world frame #{sequence} is still missing after {WorldGapTimeoutMs / 1000} s with {_frames.Buffered} later frames buffered");
+			return _inboundFailure;
+		}
+	}
+
+	private bool FailInbound(string reason)
+	{
+		_inboundFailure = reason;
+		GameLog.Instance.Warn($"engine {Name}: {reason}; closing the connection so a new session can recover");
+		return false;
+	}
+
+	/// <summary>Network thread. False when this ordered stream must be closed, never skipped or reset in place.</summary>
 	public bool Offer(byte[] message)
 	{
-		BytesIn += message.Length;
-		if ((SyncMsg)message[0] == SyncMsg.EngineState)
+		lock (_inboundGate)
 		{
-			if (_state.Count < 4096) _state.Enqueue(message);
+			if (_disposed) return true;
+			if (_overflowed || _inboundFailure != null) return false;
+			BytesIn += message.Length;
+			bool server = Host.IsServer;
+			long byteLimit = server ? MaxPendingBytesFromClient : MaxPendingBytesFromHost;
+			if ((SyncMsg)message[0] == SyncMsg.EngineState)
+			{
+				if (_state.Count < 4096 && _pendingBytes + message.Length <= byteLimit)
+				{
+					_state.Enqueue(message);
+					_pendingBytes += message.Length;
+				}
+				return true;
+			}
+			if (_pendingBytes + message.Length > byteLimit)
+				return FailInbound($"more than {byteLimit >> 20} MiB of engine data is pending scene processing");
+			if (!server && _frames.Ready + _frames.Buffered >= MaxPendingFramesFromHost)
+				return FailInbound($"more than {MaxPendingFramesFromHost} world frames are pending scene processing");
+			long overflowBefore = _frames.Overflow;
+			if (_frames.Offer(EngineWire.SeqOf(message), message, MpClock.NowMs()))
+			{
+				_pendingBytes += message.Length;
+				return true;
+			}
+			if (_frames.Overflow != overflowBefore)
+				return FailInbound($"the world reorder buffer is full (waiting for #{_frames.NextExpected})");
+			GameLog.Instance.WarnOnce("engine-frame-dup-" + Name, $"engine {Name}: frame #{EngineWire.SeqOf(message)} was a duplicate (waiting for #{_frames.NextExpected})");
 			return true;
 		}
-		bool server = Host.IsServer;
-		if (_overflowed) return false;
-		if (server && System.Threading.Interlocked.Read(ref _pendingBytes) + message.Length > MaxPendingBytesFromClient)
-		{
-			_overflowed = true;
-			GameLog.Instance.Warn($"engine {Name}: the player sent more than {MaxPendingBytesFromClient >> 20} MiB the server had not read yet; disconnecting it");
-			return false;
-		}
-		long overflowBefore = _frames.Overflow;
-		if (_frames.Offer(EngineWire.SeqOf(message), message))
-		{
-			System.Threading.Interlocked.Add(ref _pendingBytes, message.Length);
-			return true;
-		}
-		if (server && _frames.Overflow != overflowBefore)
-		{
-			_overflowed = true;
-			GameLog.Instance.Warn($"engine {Name}: more than {MaxEarlyFramesFromClient} frames came out of sequence (waiting for #{_frames.NextExpected}); disconnecting the player");
-			return false;
-		}
-		GameLog.Instance.WarnOnce("engine-frame-dup-" + Name, $"engine {Name}: frame #{EngineWire.SeqOf(message)} was a duplicate or overflowed the reorder buffer (waiting for #{_frames.NextExpected})");
-		return true;
 	}
 
 	/// <summary>Scene thread, in the game's inbound replication job.</summary>
 	public void ProcessInbound()
 	{
-		if (_disposed) return;
+		if (_disposed || InboundFailure != null) return;
 		try { ProcessInboundCore(); }
 		// Where the game unpairs what the server destroyed: after everything of this job's frames was applied.
 		finally { if (!Host.IsServer) Host.Ids.EndInbound(); }
@@ -721,7 +749,7 @@ internal abstract class Y51PeerTransport : IPeerTransport, IDisposable, EngineWi
 		System.Threading.Volatile.Write(ref _leftAfterTake, _frames.Ready + _frames.Buffered);
 		ApplyParked();
 		bool beat = FramesIn != framesBefore;
-		while (_state.TryDequeue(out byte[] message))
+		while (TryTakeInbound(state: true, out byte[] message))
 		{
 			beat = true;
 			try { EngineWire.ReadState(message, this); }
@@ -738,16 +766,27 @@ internal abstract class Y51PeerTransport : IPeerTransport, IDisposable, EngineWi
 		}
 	}
 
+	private bool TryTakeInbound(bool state, out byte[] message)
+	{
+		lock (_inboundGate)
+		{
+			message = null!;
+			if (_inboundFailure != null) return false;
+			if (!(state ? _state.TryDequeue(out message) : _frames.TryTake(out _, out message))) return false;
+			_pendingBytes -= message.Length;
+			return true;
+		}
+	}
+
 	private void TakeFrames()
 	{
 		// Within the job's budget (the server's, OwnArchive): this player's first frame always, further ones while it lasts.
 		bool first = true;
-		while ((first || !OwnArchive.BudgetSpent) && _frames.TryTake(out _, out byte[] frame))
+		while ((first || !OwnArchive.BudgetSpent) && TryTakeInbound(state: false, out byte[] frame))
 		{
 			first = false;
 			FramesIn++;
 			_lostThisFrame = 0;
-			System.Threading.Interlocked.Add(ref _pendingBytes, -frame.Length);
 			try { EngineWire.Read(_inflater.Unpack(frame), this); }
 			catch (Exception ex)
 			{

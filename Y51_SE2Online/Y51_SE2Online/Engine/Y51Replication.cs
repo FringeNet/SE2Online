@@ -43,6 +43,7 @@ internal static class Y51Replication
 	internal static Y51ClientTransport? Client => _client;
 	private static ClientSession? _clientSession;
 	private static readonly List<byte[]> ClientEarly = new();
+	private static long _clientEarlyBytes;
 	private static long _logMs;
 
 	public static void Install(Harmony harmony)
@@ -232,9 +233,14 @@ internal static class Y51Replication
 		{
 			_client?.Dispose();
 			var transport = new Y51ClientTransport(OwnHost.For(session, replication, core, context), net.SendEngine);
-			if (!ReferenceEquals(net, _clientSession)) ClientEarly.Clear();
-			foreach (byte[] early in ClientEarly) transport.Offer(early);
-			ClientEarly.Clear();
+			if (!ReferenceEquals(net, _clientSession)) ClearClientEarly();
+			foreach (byte[] early in ClientEarly)
+				if (!transport.Offer(early))
+				{
+					net.FailConnection(transport.InboundFailure ?? "too much pending world data");
+					break;
+				}
+			ClearClientEarly();
 			_clientSession = net;
 			_client = transport;
 			// The world's frame jobs start only once it has loaded: the watchdog counts from here.
@@ -253,7 +259,7 @@ internal static class Y51Replication
 			_client?.Dispose();
 			_client = null;
 			_clientSession = null;
-			ClientEarly.Clear();
+			ClearClientEarly();
 		}
 	}
 
@@ -276,17 +282,36 @@ internal static class Y51Replication
 	{
 		lock (ClientGate)
 		{
-			if (_client != null && ReferenceEquals(session, _clientSession)) { _client.Offer(data); return; }
+			if (session.ConnectionFailureRequested) return;
+			if (_client != null && ReferenceEquals(session, _clientSession))
+			{
+				if (!_client.Offer(data)) session.FailConnection(_client.InboundFailure ?? "too much pending world data");
+				return;
+			}
 			if (!ReferenceEquals(session, _clientSession))
 			{
-				ClientEarly.Clear();
+				ClearClientEarly();
 				_clientSession = session;
 				_client?.Dispose();
 				_client = null;
 			}
 			// The server starts sending as soon as the game's handshake is done; the client session is still being built.
-			if (ClientEarly.Count < 100_000) ClientEarly.Add(data);
+			if (ClientEarly.Count >= Y51PeerTransport.MaxPendingFramesFromHost ||
+				_clientEarlyBytes + data.Length > Y51PeerTransport.MaxPendingBytesFromHost)
+			{
+				ClearClientEarly();
+				session.FailConnection("world data exceeded the pending byte/count limit before its scene was created");
+				return;
+			}
+			ClientEarly.Add(data);
+			_clientEarlyBytes += data.Length;
 		}
+	}
+
+	private static void ClearClientEarly()
+	{
+		ClientEarly.Clear();
+		_clientEarlyBytes = 0;
 	}
 
 	// --- frame slots (KeenOff) ---
@@ -299,6 +324,9 @@ internal static class Y51Replication
 	internal static void Watchdog()
 	{
 		long now = MpClock.NowMs();
+		lock (ClientGate)
+			if (_client != null && _clientSession != null && _client.CheckInboundFailure(now) is { } reason)
+				_clientSession.FailConnection(reason);
 		bool active = !ServersByClient.IsEmpty || _client != null;
 		if (!active) { _watchMs = now; return; }
 		long seen = Math.Min(System.Threading.Volatile.Read(ref _inboundMs), System.Threading.Volatile.Read(ref _outboundMs));

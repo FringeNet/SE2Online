@@ -1,0 +1,48 @@
+SE2 Online reliable backlog test patch
+
+Based on 1077df8, retaining the simultaneous control-panel crash fix, guest
+movement/playback fixes and the normal VSync preference. Mod version stays
+0.18.4 (assembly 0.18.4.0), sync 21 / frame 2 / wire 1. No message format,
+settings, game files or dependencies change. Update both host and guest to
+receive all fixes; older peers can connect but retain their side's bugs.
+
+Cause reproduced
+---------------
+A reliable Control send refused by the native link was discarded while its
+encoded world stream continued. Later frames then waited permanently for the
+missing sequence. This was reproduced through the production transport,
+loopback link, EngineWire and continuous compression. Historical logs show
+send-buffer refusal and a stuck world sequence, but do not establish which
+specific frame was lost or why the Steam connection changed route.
+
+Changes
+-------
+* Retain the exact encoded Control frame and retry in order after Busy.
+  Advance accepted counters only after the native link accepts the frame.
+* Tie queued work to its connection generation. Bound ingress, Control and
+  Bulk work; keep State/ACK/liveness maintenance running during backlog.
+* Close explicitly on reliable send failure, exhausted queue bounds,
+  over-age queued work or expired incomplete reliable reassembly.
+* Bound guest pending world data, including preworld and ready scene work,
+  to 512 MiB / 100,000 frames. State remains lossy and bounded.
+* Close a world stream missing the same sequence for 300 seconds while later
+  frames are buffered. Never skip frames or reset continuous inflation in
+  place. Existing optional automatic rejoin remains in charge of reconnects.
+* Ignore Steam's unavailable global queue-time value with multiple lanes.
+
+Limits for the coordinated test
+------------------------------
+The managed message age ceiling and world-gap timeout are 300 seconds by
+default. A maximum 256 MiB uncompressed transfer below roughly 0.85 MiB/s can
+therefore require a new join. The limits are conservative and need live
+validation. This patch does not explain route changes or change unreliable
+EngineState traffic shaping, renderer timing or native simulation speed.
+
+The transport source checks use deterministic native-link refusal, not Steam
+or real sockets. Native assembly checks do not start a world. Build and test
+logs, exact package hashes, installation steps and rollback are supplied with
+each staged package. A passing harness is not a live gameplay result.
+
+Do not replace installed files while the game is running. The coordinator
+must establish closure from the user/Wesley or a fresh process check, back up
+both DLL/PDB files, and record installed hashes before restarting either PC.

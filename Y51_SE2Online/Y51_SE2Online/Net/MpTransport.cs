@@ -11,6 +11,11 @@ public sealed class MpTransport : ITransport, IDisposable
 {
 	private sealed class BulkOut
 	{
+		public long QueuedMs;
+		public int CostBytes;
+		public byte Type;
+		public int Length;
+
 		public uint TransferId;
 
 		public ReadOnlyMemory<byte> Data;
@@ -21,6 +26,13 @@ public sealed class MpTransport : ITransport, IDisposable
 
 		/// <summary>A big message being deflated on a worker; it goes (and everything queued after it waits) once done.</summary>
 		public System.Threading.Tasks.Task<ReadOnlyMemory<byte>?>? Packing;
+	}
+
+	private sealed class ControlOut(byte[] frame, long queuedMs, int costBytes)
+	{
+		public readonly byte[] Frame = frame;
+		public readonly long QueuedMs = queuedMs;
+		public readonly int CostBytes = costBytes;
 	}
 
 	private sealed class PeerState
@@ -34,6 +46,18 @@ public sealed class MpTransport : ITransport, IDisposable
 		public bool Ready;
 
 		public bool Closed;
+
+		public readonly object SendLock = new();
+		public readonly Queue<OutRequest> Out = new();
+		public readonly Queue<ControlOut> Control = new();
+		public uint NextControlSeq;
+		public long QueuedBytes;
+		public long ControlQueuedBytes;
+		public int QueuedMessages;
+		public string? PendingClose;
+		public int PendingCloseCode;
+		public bool FlushBeforeClose;
+		public long RejectedState;
 
 		public long LinkConnectedMs;
 
@@ -78,38 +102,26 @@ public sealed class MpTransport : ITransport, IDisposable
 
 	private readonly struct OutRequest
 	{
-		public readonly PeerId Peer;
-
 		public readonly Channel Channel;
 
 		public readonly ReadOnlyMemory<byte> Payload;
 
 		public readonly ulong Token;
 
-		public readonly int DisconnectCode;
+		public readonly long QueuedMs;
+		public readonly int CostBytes;
+		public readonly byte Type;
+		public readonly int Length;
 
-		public readonly string? DisconnectReason;
-
-		public bool IsDisconnect => DisconnectReason != null;
-
-		public OutRequest(PeerId peer, Channel channel, ReadOnlyMemory<byte> payload, ulong token)
+		public OutRequest(Channel channel, ReadOnlyMemory<byte> payload, ulong token, long queuedMs, int costBytes, byte type, int length)
 		{
-			Peer = peer;
 			Channel = channel;
 			Payload = payload;
 			Token = token;
-			DisconnectCode = 0;
-			DisconnectReason = null;
-		}
-
-		public OutRequest(PeerId peer, int code, string reason)
-		{
-			Peer = peer;
-			Channel = Channel.Control;
-			Payload = default;
-			Token = 0;
-			DisconnectCode = code;
-			DisconnectReason = reason;
+			QueuedMs = queuedMs;
+			CostBytes = costBytes;
+			Type = type;
+			Length = length;
 		}
 	}
 
@@ -125,7 +137,8 @@ public sealed class MpTransport : ITransport, IDisposable
 
 	private readonly Dictionary<PeerId, PeerState> _byPeer = new();
 
-	private readonly ConcurrentQueue<OutRequest> _out = new();
+	// Producer threads capture a connection object, never a PeerId that could later name its replacement.
+	private readonly ConcurrentDictionary<PeerId, PeerState> _sendPeers = new();
 
 	private readonly List<LinkEvent> _events = new();
 
@@ -137,7 +150,7 @@ public sealed class MpTransport : ITransport, IDisposable
 
 	private long _nextToken;
 
-	private bool _disposed;
+	private volatile bool _disposed;
 
 	public IReadOnlyList<PeerId> Peers => Volatile.Read(in _peers);
 
@@ -155,7 +168,7 @@ public sealed class MpTransport : ITransport, IDisposable
 
 	public Func<PeerId, bool>? BulkGate { get; set; }
 
-	/// <summary>Messages queued for sending and delivered to handlers, by message type (uncompressed sizes).</summary>
+	/// <summary>Messages accepted by the link and delivered to handlers, by message type (uncompressed sizes).</summary>
 	public MessageTally Sent { get; } = new();
 
 	public MessageTally Received { get; } = new();
@@ -166,6 +179,10 @@ public sealed class MpTransport : ITransport, IDisposable
 		_o = options;
 		_log = log;
 		_clock = clock ?? new Func<long>(MpClock.NowMs);
+		if (_o.PingTimeoutMs <= 0 || _o.MaxQueuedControlBytes <= 0 || _o.MaxQueuedSendMessages <= 0)
+		{
+			throw new ArgumentException("send queue limits and PingTimeoutMs must be positive");
+		}
 		int fragmentFrame = Frame.HeaderSize + FragmentHeader.Size + _o.FragmentPayload;
 		if (fragmentFrame > link.MaxMessageSize)
 		{
@@ -173,9 +190,10 @@ public sealed class MpTransport : ITransport, IDisposable
 		}
 	}
 
-	// Thread-safe: requests are queued and dispatched on the next Poll.
+	// Thread-safe: Control is copied; Bulk/State callers keep their memory unchanged until dispatched/accepted.
 	public ulong Send(PeerId peer, Channel channel, ReadOnlyMemory<byte> payload)
 	{
+		if ((uint)channel > (uint)Channel.State) throw new ArgumentOutOfRangeException(nameof(channel));
 		int maxDirect = MaxDirectPayload(channel);
 		if (channel != Channel.Bulk && payload.Length > maxDirect)
 		{
@@ -188,26 +206,73 @@ public sealed class MpTransport : ITransport, IDisposable
 			_log.Warn($"bulk message (type {(payload.Length > 0 ? payload.Span[0] : 0)}) of {payload.Length} B exceeds the {maxBulk} B the {(_o.Role == 0 ? "client" : "host")} accepts; not sent");
 			return 0;
 		}
-		int length = payload.Length;
-		byte type = length > 0 ? payload.Span[0] : (byte)0;
-		if (channel == Channel.Bulk && BulkCompression.IsEnvelope(payload.Span))
+		if (!_sendPeers.TryGetValue(peer, out var p)) return 0;
+		lock (p.SendLock)
 		{
-			// Packed once by the caller for many peers.
-			type = payload.Span[1 + 4];
-			length = BulkCompression.DeclaredLength(payload.Span);
+			if (_disposed || p.Closed || !p.Ready || p.PendingClose != null) return 0;
+			int cost = payload.Length + Frame.HeaderSize + (channel == Channel.State ? StatePrefix.Size : 0);
+			if (!Reserve(p, channel, cost)) return 0;
+			// Freeze the small reliable lane; bulk keeps the existing caller-owned lifetime without copying whole worlds.
+			if (channel == Channel.Control) payload = payload.ToArray();
+			int length = payload.Length;
+			byte type = length > 0 ? payload.Span[0] : (byte)0;
+			if (channel == Channel.Bulk && BulkCompression.IsEnvelope(payload.Span))
+			{
+				type = payload.Span[5];
+				length = BulkCompression.DeclaredLength(payload.Span);
+			}
+			else if (channel == Channel.Bulk && payload.Length < BulkCompression.PackLaterBytes && BulkCompression.Pack(payload.Span, MaxInflatedOut) is { } packed)
+			{
+				payload = packed;
+			}
+			ulong token = (ulong)Interlocked.Increment(ref _nextToken);
+			p.Out.Enqueue(new OutRequest(channel, payload, token, _clock(), cost, type, length));
+			Core.LatencyTrace.Mark(Core.LatencyTrace.Queued, payload.Span, (int)channel, peer.Value);
+			return token;
 		}
-		else if (channel == Channel.Bulk && payload.Length < BulkCompression.PackLaterBytes && BulkCompression.Pack(payload.Span, MaxInflatedOut) is { } packed)
-		{
-			payload = packed;
-		}
-		ulong token = (ulong)Interlocked.Increment(ref _nextToken);
-		if (length > 0) Sent.Add(type, length);
-		_out.Enqueue(new OutRequest(peer, channel, payload, token));
-		Core.LatencyTrace.Mark(Core.LatencyTrace.Queued, payload.Span, (int)channel, peer.Value);
-		return token;
 	}
 
-	public void Disconnect(PeerId peer, int code, string reason) => _out.Enqueue(new OutRequest(peer, code, reason));
+	public void Disconnect(PeerId peer, int code, string reason)
+	{
+		if (!_sendPeers.TryGetValue(peer, out var p)) return;
+		lock (p.SendLock)
+		{
+			if (!p.Closed && p.PendingClose == null)
+			{
+				p.PendingClose = reason;
+				p.PendingCloseCode = code;
+				p.FlushBeforeClose = true;
+			}
+		}
+	}
+
+	// Also counts ingress, so a stalled Poll cannot hide an unbounded producer backlog.
+	private bool Reserve(PeerState p, Channel channel, int bytes)
+	{
+		long maxBytes = 2L * (_o.Role == 0 ? _o.MaxBulkMessageBytes : _o.MaxBulkFromClientBytes) + _o.MaxQueuedControlBytes;
+		if (p.QueuedMessages >= _o.MaxQueuedSendMessages || p.QueuedBytes + bytes > maxBytes ||
+			(channel == Channel.Control && p.ControlQueuedBytes + bytes > _o.MaxQueuedControlBytes))
+		{
+			p.PendingClose = $"send backlog limit exceeded ({p.QueuedMessages} messages, {p.QueuedBytes} B; {channel} needs {bytes} B)";
+			p.PendingCloseCode = DisconnectCodes.PingTimeout;
+			return false;
+		}
+		p.QueuedMessages++;
+		p.QueuedBytes += bytes;
+		if (channel == Channel.Control) p.ControlQueuedBytes += bytes;
+		return true;
+	}
+
+	private static void Release(PeerState p, Channel channel, int bytes)
+	{
+		lock (p.SendLock)
+		{
+			if (p.Closed) return;
+			p.QueuedMessages--;
+			p.QueuedBytes -= bytes;
+			if (channel == Channel.Control) p.ControlQueuedBytes -= bytes;
+		}
+	}
 
 	/// <summary>The largest message the other side inflates (<see cref="BulkCompression.Pack"/>'s limit).</summary>
 	public int MaxInflatedOut => _o.Role == 0 ? _o.MaxInflatedFromHostBytes : _o.MaxInflatedFromClientBytes;
@@ -269,14 +334,21 @@ public sealed class MpTransport : ITransport, IDisposable
 			}
 		}
 		double handleMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds - pumpMs;
-		OutRequest request;
 		int dispatched = 0;
 		long dispatchedBytes = 0;
-		while (_out.TryDequeue(out request))
+		foreach (var p in ToArray())
 		{
-			dispatched++;
-			dispatchedBytes += request.Payload.Length;
-			Dispatch(in request, now);
+			for (int i = 0; i < 256; i++)
+			{
+				OutRequest request;
+				lock (p.SendLock)
+				{
+					if (p.Closed || (p.PendingClose != null && !p.FlushBeforeClose) || !p.Out.TryDequeue(out request)) break;
+				}
+				dispatched++;
+				dispatchedBytes += request.Payload.Length;
+				Dispatch(p, in request, now);
+			}
 		}
 		double dispatchMs = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds - pumpMs - handleMs;
 		_lastPoll = (pumpMs, _messages.Count, handleMs, dispatched, dispatchedBytes, dispatchMs);
@@ -307,8 +379,34 @@ public sealed class MpTransport : ITransport, IDisposable
 
 	private void Service(PeerState p, long now)
 	{
+		string? close;
+		int code;
+		long oldest = now;
+		lock (p.SendLock)
+		{
+			close = p.PendingClose;
+			code = p.PendingCloseCode;
+			if (p.Out.TryPeek(out var request)) oldest = Math.Min(oldest, request.QueuedMs);
+		}
+		if (p.Control.TryPeek(out var control)) oldest = Math.Min(oldest, control.QueuedMs);
+		if (p.Bulk.TryPeek(out var bulk)) oldest = Math.Min(oldest, bulk.QueuedMs);
+		if (now - oldest > _o.PingTimeoutMs * 10L)
+		{
+			Close(p, DisconnectCodes.PingTimeout, $"send backlog exceeded maximum age (oldest {now - oldest} ms)", byPeer: false, "timeout", notifyPeer: true);
+			return;
+		}
+		if (close != null)
+		{
+			// Preserve preceding notices over bounded polls while accepted; a refusal must never delay closing.
+			bool accepting = p.FlushBeforeClose && PumpControl(p);
+			if (p.Closed) return;
+			if (accepting && (p.Control.Count > 0 || p.Out.Count > 0)) return;
+			Close(p, code, close, byPeer: false, "local", notifyPeer: true);
+			return;
+		}
 		if (!p.Ready)
 		{
+			PumpControl(p);
 			if (now - p.LinkConnectedMs > _o.HelloTimeoutMs)
 			{
 				Close(p, DisconnectCodes.HelloTimeout, $"no Hello within {_o.HelloTimeoutMs} ms", byPeer: false, "timeout", notifyPeer: true);
@@ -331,7 +429,6 @@ public sealed class MpTransport : ITransport, IDisposable
 			p.LastPingSentMs = now;
 			var ping = new WireWriter(16).U32(p.NextPingId++).I64(_clock());
 			SendFrame(p, Channel.Control, FrameKind.Ping, ping.ToArray(), reliable: true);
-			p.Stats.PingsSent++;
 		}
 		long lastHeardMs = p.Stats.LastPongMs > 0 ? p.Stats.LastPongMs : p.Stats.ConnectedMs;
 		if (now - lastHeardMs > _o.PingTimeoutMs)
@@ -357,16 +454,43 @@ public sealed class MpTransport : ITransport, IDisposable
 		}
 		if (p.Reassembler.Expire(now) > 0)
 		{
-			_log.Warn($"peer {p.Id}: {p.Reassembler.LastError}");
+			Close(p, DisconnectCodes.PingTimeout, $"reliable reassembly failed: {p.Reassembler.LastError}", byPeer: false, "timeout", notifyPeer: true);
+			return;
 		}
-		PumpBulk(p);
+		PumpControl(p);
+		if (!p.Closed && p.Control.Count == 0) PumpBulk(p);
+	}
+
+	// False means native refusal, rather than merely reaching this poll's effort budget.
+	private bool PumpControl(PeerState p)
+	{
+		int bytes = 0;
+		for (int i = 0; i < 256 && bytes < 1048576 && !p.Closed && p.Control.TryPeek(out var item); i++)
+		{
+			var result = _link.Send(p.Conn, Channel.Control, reliable: true, item.Frame);
+			if (result == LinkSendResult.Busy) { p.Stats.SendBusy++; return false; }
+			if (result != LinkSendResult.Ok)
+			{
+				Close(p, DisconnectCodes.PingTimeout, "reliable Control send failed", byPeer: false, "link-send", notifyPeer: false);
+				return false;
+			}
+			p.Control.Dequeue();
+			Release(p, Channel.Control, item.CostBytes);
+			Frame.TryRead(item.Frame, out var header, out var payload, out _);
+			AcceptedFrame(p, Channel.Control, header.Seq, item.Frame.Length);
+			if (header.Kind == FrameKind.Data) AcceptedMessage(p, Channel.Control, payload);
+			else if (header.Kind == FrameKind.Ping) p.Stats.PingsSent++;
+			bytes += item.Frame.Length;
+		}
+		return true;
 	}
 
 	// Feeds bulk fragments only while the link's reliable backlog is under the high-water mark,
 	// so a large transfer cannot starve Control and State traffic.
 	private void PumpBulk(PeerState p)
 	{
-		while (p.Bulk.Count > 0 && _link.GetPendingReliableBytes(p.Conn) < (_link.HasLanePriorities(p.Conn) ? _o.BulkHighWaterLanesBytes : _o.BulkHighWaterBytes))
+		int bytes = 0;
+		for (int i = 0; i < 256 && bytes < 1048576 && !p.Closed && p.Bulk.Count > 0 && _link.GetPendingReliableBytes(p.Conn) < (_link.HasLanePriorities(p.Conn) ? _o.BulkHighWaterLanesBytes : _o.BulkHighWaterBytes); i++)
 		{
 			var bulk = p.Bulk.Peek();
 			if (bulk.Packing != null && !Packed(p, bulk)) return;
@@ -383,17 +507,21 @@ public sealed class MpTransport : ITransport, IDisposable
 				p.Stats.SendBusy++;
 				return;
 			case LinkSendResult.Failed:
+				Close(p, DisconnectCodes.PingTimeout, "reliable Bulk send failed", byPeer: false, "link-send", notifyPeer: false);
 				return;
 			}
 			p.TxSeq[(int)Channel.Bulk] = seq;
 			ref var stats = ref p.Stats.Channels[(int)Channel.Bulk];
 			stats.FramesSent++;
 			stats.BytesSent += frame.Length;
+			bytes += frame.Length;
 			if (++bulk.Next == bulk.Count)
 			{
 				p.Bulk.Dequeue();
 				p.BulkQueuedBytes -= bulk.Data.Length;
+				Release(p, Channel.Bulk, bulk.CostBytes);
 				stats.MessagesSent++;
+				if (bulk.Length > 0) Sent.Add(bulk.Type, bulk.Length);
 				Core.LatencyTrace.Mark(Core.LatencyTrace.Sent, bulk.Data.Span, (int)Channel.Bulk, p.Id.Value);
 			}
 		}
@@ -419,41 +547,25 @@ public sealed class MpTransport : ITransport, IDisposable
 
 	private static readonly System.Threading.SemaphoreSlim PackGate = new(2);
 
-	private void Dispatch(in OutRequest req, long now)
+	private void Dispatch(PeerState p, in OutRequest req, long now)
 	{
-		if (!_byPeer.TryGetValue(req.Peer, out var p) || p.Closed)
-		{
-			if (!req.IsDisconnect)
-			{
-				_log.WarnOnce($"send-unknown-{req.Peer}", $"dropping {req.Channel} message for unknown/closed peer {req.Peer}");
-			}
-			return;
-		}
-		if (req.IsDisconnect)
-		{
-			Close(p, req.DisconnectCode, req.DisconnectReason, byPeer: false, "local", notifyPeer: true);
-			return;
-		}
-		if (!p.Ready)
-		{
-			_log.WarnOnce($"send-notready-{req.Peer}", $"dropping {req.Channel} message for peer {req.Peer}: handshake not finished");
-			return;
-		}
 		switch (req.Channel)
 		{
 		case Channel.Control:
-			SendFrame(p, Channel.Control, FrameKind.Data, req.Payload.Span, reliable: true);
-			p.Stats.Channels[(int)Channel.Control].MessagesSent++;
-			Core.LatencyTrace.Mark(Core.LatencyTrace.Sent, req.Payload.Span, (int)Channel.Control, p.Id.Value);
+			QueueControl(p, FrameKind.Data, req.Payload.Span, req.QueuedMs, req.CostBytes);
 			break;
 		case Channel.State:
 			SendStateFrame(p, FrameKind.Data, req.Payload.Span, req.Token, now);
-			p.Stats.Channels[(int)Channel.State].MessagesSent++;
-			Core.LatencyTrace.Mark(Core.LatencyTrace.Sent, req.Payload.Span, (int)Channel.State, p.Id.Value);
+			Release(p, Channel.State, req.CostBytes);
 			break;
 		case Channel.Bulk:
+			if (p.PendingClose != null && p.FlushBeforeClose)
+			{
+				Release(p, Channel.Bulk, req.CostBytes);
+				break;
+			}
 			var data = req.Payload;
-			var bulk = new BulkOut { TransferId = p.NextTransferId++, Data = data, Count = Fragmenter.CountFor((uint)data.Length, (uint)_o.FragmentPayload) };
+			var bulk = new BulkOut { QueuedMs = req.QueuedMs, CostBytes = req.CostBytes, Type = req.Type, Length = req.Length, TransferId = p.NextTransferId++, Data = data, Count = Fragmenter.CountFor((uint)data.Length, (uint)_o.FragmentPayload) };
 			// A big message (a world's initial batch: ~0.3 s for 52 MiB) is deflated on a worker; pings and acks of every
 			// player keep flowing meanwhile (0.17.4 deflated it here, on the network thread).
 			if (data.Length >= BulkCompression.PackLaterBytes && !BulkCompression.IsEnvelope(data.Span))
@@ -487,13 +599,37 @@ public sealed class MpTransport : ITransport, IDisposable
 		{
 			p.StateAcks.Register(seq, token, now);
 		}
-		p.StateAckDirty = false;
-		p.LastStateSentMs = now;
+		if (seq != 0)
+		{
+			if (kind == FrameKind.Data) AcceptedMessage(p, Channel.State, payload);
+			p.StateAckDirty = false;
+			p.LastStateSentMs = now;
+		}
+		else if (token != 0)
+		{
+			p.RejectedState++;
+			Raise(StateLost, p.Id, new[] { token });
+		}
+	}
+
+	private void QueueControl(PeerState p, FrameKind kind, ReadOnlySpan<byte> payload, long queuedMs, int costBytes)
+	{
+		byte[] frame = Frame.Build(new FrameHeader(Channel.Control, kind, ++p.NextControlSeq, 0), payload);
+		p.Control.Enqueue(new ControlOut(frame, queuedMs, costBytes));
 	}
 
 	// Returns the frame's sequence number, or 0 if the link refused it.
 	private uint SendFrame(PeerState p, Channel ch, FrameKind kind, ReadOnlySpan<byte> payload, bool reliable)
 	{
+		if (ch == Channel.Control && kind != FrameKind.Bye)
+		{
+			lock (p.SendLock)
+			{
+				if (p.Closed || p.PendingClose != null || !Reserve(p, ch, Frame.HeaderSize + payload.Length)) return 0;
+			}
+			QueueControl(p, kind, payload, _clock(), Frame.HeaderSize + payload.Length);
+			return 0;
+		}
 		uint seq = p.TxSeq[(uint)ch] + 1;
 		byte[] frame = new byte[Frame.HeaderSize + payload.Length];
 		Frame.Write(frame, new FrameHeader(ch, kind, seq, 0));
@@ -508,11 +644,23 @@ public sealed class MpTransport : ITransport, IDisposable
 			_log.WarnOnce($"send-{result}-{p.Id}-{ch}", $"peer {p.Id}: link refused {ch}/{kind} frame ({result})");
 			return 0;
 		}
+		AcceptedFrame(p, ch, seq, frame.Length);
+		return seq;
+	}
+
+	private static void AcceptedFrame(PeerState p, Channel ch, uint seq, int bytes)
+	{
 		p.TxSeq[(uint)ch] = seq;
 		ref var stats = ref p.Stats.Channels[(uint)ch];
 		stats.FramesSent++;
-		stats.BytesSent += frame.Length;
-		return seq;
+		stats.BytesSent += bytes;
+	}
+
+	private void AcceptedMessage(PeerState p, Channel ch, ReadOnlySpan<byte> payload)
+	{
+		p.Stats.Channels[(int)ch].MessagesSent++;
+		if (payload.Length > 0) Sent.Add(payload[0], payload.Length);
+		Core.LatencyTrace.Mark(Core.LatencyTrace.Sent, payload, (int)ch, p.Id.Value);
 	}
 
 	private void OnLinkEvent(in LinkEvent e, long now)
@@ -533,12 +681,13 @@ public sealed class MpTransport : ITransport, IDisposable
 					Conn = e.Conn,
 					Id = peerId,
 					LinkConnectedMs = now,
-					Reassembler = _o.Role == 0 ? new Reassembler(_o.MaxBulkFromClientBytes, 8, 2L * _o.MaxBulkFromClientBytes) : new Reassembler(_o.MaxBulkMessageBytes, 8, 536870912L)
+					Reassembler = _o.Role == 0 ? new Reassembler(_o.MaxBulkFromClientBytes, 8, 2L * _o.MaxBulkFromClientBytes, (int)Math.Min(int.MaxValue, _o.PingTimeoutMs * 10L)) : new Reassembler(_o.MaxBulkMessageBytes, 8, 536870912L, (int)Math.Min(int.MaxValue, _o.PingTimeoutMs * 10L))
 				};
 				p.Stats.Peer = peerId;
 				p.Stats.ConnectedMs = now;
 				_byConn[e.Conn] = p;
 				_byPeer[peerId] = p;
+				_sendPeers[peerId] = p;
 				SendHello(p);
 				_log.Info($"link up to {peerId} (conn {e.Conn}), Hello sent");
 			}
@@ -822,7 +971,7 @@ public sealed class MpTransport : ITransport, IDisposable
 		{
 			_log.Warn($"peer {p.Id}: game version {gameVersion} differs from ours ({_o.GameVersion})");
 		}
-		p.Ready = true;
+		lock (p.SendLock) p.Ready = true;
 		p.Stats.Ready = true;
 		p.Stats.RemoteName = name;
 		p.Stats.RemotePluginVersion = pluginVersion;
@@ -880,16 +1029,26 @@ public sealed class MpTransport : ITransport, IDisposable
 		{
 			return;
 		}
-		p.Closed = true;
+		lock (p.SendLock)
+		{
+			p.Closed = true;
+			p.Out.Clear();
+			p.QueuedBytes = p.ControlQueuedBytes = p.QueuedMessages = 0;
+		}
+		((ICollection<KeyValuePair<PeerId, PeerState>>)_sendPeers).Remove(new(p.Id, p));
+		p.Control.Clear();
+		p.Bulk.Clear();
+		p.BulkQueuedBytes = 0;
+		bool byeAccepted = false;
 		if (notifyPeer)
 		{
 			var bye = new WireWriter(32 + reason.Length).I32(code).Str(reason);
-			SendFrame(p, Channel.Control, FrameKind.Bye, bye.ToArray(), reliable: true);
+			byeAccepted = SendFrame(p, Channel.Control, FrameKind.Bye, bye.ToArray(), reliable: true) != 0;
 		}
 		if (source != "link")
 		{
 			// Linger only when a Bye was queued, so it reaches the peer before the link closes.
-			_link.Close(p.Conn, code, reason, notifyPeer);
+			_link.Close(p.Conn, code, reason, byeAccepted);
 		}
 		_byConn.Remove(p.Conn);
 		if (_byPeer.TryGetValue(p.Id, out var current) && current == p)
@@ -933,6 +1092,12 @@ public sealed class MpTransport : ITransport, IDisposable
 		var stats = p.Stats;
 		stats.BulkQueuedMessages = p.Bulk.Count;
 		stats.BulkQueuedBytes = p.BulkQueuedBytes;
+		lock (p.SendLock)
+		{
+			stats.SendQueuedMessages = p.QueuedMessages;
+			stats.SendQueuedBytes = p.QueuedBytes;
+			stats.ControlQueuedBytes = p.ControlQueuedBytes;
+		}
 		stats.ReassemblyInProgress = p.Reassembler.InProgress;
 		stats.ReassemblyBytes = p.Reassembler.PendingBytes;
 		stats.ReassemblyTotalBytes = p.Reassembler.PendingTotalBytes;
@@ -942,7 +1107,7 @@ public sealed class MpTransport : ITransport, IDisposable
 		stats.StateMissing = p.StateRx.Missing;
 		stats.StateDuplicates = p.StateRx.Duplicates;
 		stats.StateAcked = p.StateAcks.Acked;
-		stats.StateLost = p.StateAcks.Failed;
+		stats.StateLost = p.StateAcks.Failed + p.RejectedState;
 		stats.StateInFlight = p.StateAcks.InFlight;
 		stats.LinkPendingBytes = _link.GetPendingReliableBytes(p.Conn);
 	}
@@ -1014,8 +1179,8 @@ public sealed class MpTransport : ITransport, IDisposable
 	{
 		if (!_disposed)
 		{
-			DisconnectAll(DisconnectCodes.Shutdown, "shutting down");
 			_disposed = true;
+			DisconnectAll(DisconnectCodes.Shutdown, "shutting down");
 		}
 	}
 }

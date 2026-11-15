@@ -591,7 +591,7 @@ internal sealed class SteamLink : IPacketLink, IDisposable
 		var status = new SteamNetConnectionRealTimeStatus_t { reserved = new uint[16] };
 		var lanes = new SteamNetConnectionRealTimeLaneStatus_t { reserved = new uint[10] };
 		return _api.GetConnectionRealTimeStatus(c.Handle, ref status, 0, ref lanes) == EResult.k_EResultOK
-			&& Y51_SE2Online.Sync.LinkGrace.Backlogged(status.m_cbPendingReliable, status.m_usecQueueTime.m_SteamNetworkingMicroseconds);
+			&& Y51_SE2Online.Sync.LinkGrace.Backlogged(status.m_cbPendingReliable, status.m_usecQueueTime.m_SteamNetworkingMicroseconds, c.LanesOk);
 	}
 
 	public int GetPendingReliableBytes(uint conn)
@@ -647,7 +647,9 @@ internal sealed class SteamLink : IPacketLink, IDisposable
 		string flags = Flags(info.m_nFlags);
 		if (statusResult == EResult.k_EResultOK)
 		{
-			return $"route={route} flags={flags} ping={status.m_nPing} ms quality local={status.m_flConnectionQualityLocal:0.00} remote={status.m_flConnectionQualityRemote:0.00} out={status.m_flOutBytesPerSec / 1024f:0.0} KiB/s in={status.m_flInBytesPerSec / 1024f:0.0} KiB/s sendRate={status.m_nSendRateBytesPerSecond / 1024} KiB/s pendingRel={status.m_cbPendingReliable} unackedRel={status.m_cbSentUnackedReliable} pendingUnrel={status.m_cbPendingUnreliable} queue={(double)status.m_usecQueueTime.m_SteamNetworkingMicroseconds / 1000.0:0.0} ms desc='{info.m_szConnectionDescription}'";
+			long queueTime = status.m_usecQueueTime.m_SteamNetworkingMicroseconds;
+			string queue = !c.LanesOk && queueTime >= 0 && queueTime != long.MaxValue ? $"{queueTime / 1000.0:0.0} ms" : "unavailable";
+			return $"route={route} flags={flags} ping={status.m_nPing} ms quality local={status.m_flConnectionQualityLocal:0.00} remote={status.m_flConnectionQualityRemote:0.00} out={status.m_flOutBytesPerSec / 1024f:0.0} KiB/s in={status.m_flInBytesPerSec / 1024f:0.0} KiB/s sendRate={status.m_nSendRateBytesPerSecond / 1024} KiB/s pendingRel={status.m_cbPendingReliable} unackedRel={status.m_cbSentUnackedReliable} pendingUnrel={status.m_cbPendingUnreliable} queue={queue} desc='{info.m_szConnectionDescription}'";
 		}
 		return $"route={route} flags={flags} (realtime status {statusResult})";
 	}

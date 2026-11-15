@@ -36,6 +36,13 @@ public sealed class PeerStats
 
 	public long BulkQueuedBytes;
 
+	/// <summary>All managed send work, including ingress and messages whose final fragment is not yet accepted.</summary>
+	public int SendQueuedMessages;
+
+	public long SendQueuedBytes;
+
+	public long ControlQueuedBytes;
+
 	public int ReassemblyInProgress;
 
 	/// <summary>Bytes in of the messages still being reassembled, and their declared lengths.</summary>

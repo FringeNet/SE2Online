@@ -14,7 +14,11 @@ public static class LinkGrace
 	/// <summary>Ping at or above this is worth a link log line at once.</summary>
 	public const int BadPingMs = 300;
 
-	public static bool Backlogged(long pendingReliableBytes, long queueMicroseconds) => pendingReliableBytes > BacklogBytes || queueMicroseconds > BacklogQueueMicroseconds;
+	public static bool Backlogged(long pendingReliableBytes, long queueMicroseconds) => Backlogged(pendingReliableBytes, queueMicroseconds, false);
+
+	// Steam's connection-wide queue time is unavailable with multiple lanes.
+	public static bool Backlogged(long pendingReliableBytes, long queueMicroseconds, bool multipleLanes)
+		=> pendingReliableBytes > BacklogBytes || !multipleLanes && queueMicroseconds != long.MaxValue && queueMicroseconds > BacklogQueueMicroseconds;
 
 	public static bool Bad(int pingMs, long pendingReliableBytes, long queueMicroseconds) => pingMs >= BadPingMs || Backlogged(pendingReliableBytes, queueMicroseconds);
 }

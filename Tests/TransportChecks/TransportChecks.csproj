@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/AckTracker.cs" Link="Source/AckTracker.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/BulkCompression.cs" Link="Source/BulkCompression.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/Channel.cs" Link="Source/Channel.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/ChannelStats.cs" Link="Source/ChannelStats.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/DisconnectCodes.cs" Link="Source/DisconnectCodes.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/DisconnectInfo.cs" Link="Source/DisconnectInfo.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/FragmentHeader.cs" Link="Source/FragmentHeader.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/Fragmenter.cs" Link="Source/Fragmenter.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/Frame.cs" Link="Source/Frame.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/FrameHeader.cs" Link="Source/FrameHeader.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/FrameKind.cs" Link="Source/FrameKind.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/IPacketLink.cs" Link="Source/IPacketLink.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/ITransport.cs" Link="Source/ITransport.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/LinkEvent.cs" Link="Source/LinkEvent.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/LinkEventKind.cs" Link="Source/LinkEventKind.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/LinkMessage.cs" Link="Source/LinkMessage.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/LinkSendResult.cs" Link="Source/LinkSendResult.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/LoopbackLink.cs" Link="Source/LoopbackLink.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/MessageTally.cs" Link="Source/MessageTally.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/MpTransport.cs" Link="Source/MpTransport.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/PeerAlias.cs" Link="Source/PeerAlias.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/PeerId.cs" Link="Source/PeerId.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/PeerStats.cs" Link="Source/PeerStats.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/Reassembler.cs" Link="Source/Reassembler.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/ReassemblyResult.cs" Link="Source/ReassemblyResult.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/ReceiveResult.cs" Link="Source/ReceiveResult.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/ReceiveWindow.cs" Link="Source/ReceiveWindow.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/ReliableCheck.cs" Link="Source/ReliableCheck.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/ReliableSequenceChecker.cs" Link="Source/ReliableSequenceChecker.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/Seq.cs" Link="Source/Seq.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/StatePrefix.cs" Link="Source/StatePrefix.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/TransportOptions.cs" Link="Source/TransportOptions.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/WireReader.cs" Link="Source/WireReader.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/WireWriter.cs" Link="Source/WireWriter.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Core/IMpLog.cs" Link="Source/Core/IMpLog.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Core/MpLogExtensions.cs" Link="Source/Core/MpLogExtensions.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Core/MpClock.cs" Link="Source/Core/MpClock.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Core/LatencyTrace.cs" Link="Source/Core/LatencyTrace.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Sync/LifecycleSequencer.cs" Link="Source/Sync/LifecycleSequencer.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Sync/SyncMsg.cs" Link="Source/Sync/SyncMsg.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Engine/EngineWire.cs" Link="Source/Engine/EngineWire.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/TcpLink.cs" Link="Source/TcpLink.cs" />
+    <Compile Include="../../Y51_SE2Online/Y51_SE2Online/Net/LanePlan.cs" Link="Source/LanePlan.cs" />
+  </ItemGroup>
+</Project>

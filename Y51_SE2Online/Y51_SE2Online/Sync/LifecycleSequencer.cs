@@ -12,6 +12,7 @@ public sealed class LifecycleSequencer<T>
 	private readonly Queue<(uint Seq, T Item)> _ready = new Queue<(uint, T)>();
 
 	private uint _next = 1u;
+	private long _gapSinceMs;
 
 	public long Duplicates;
 
@@ -52,7 +53,9 @@ public sealed class LifecycleSequencer<T>
 		}
 	}
 
-	public bool Offer(uint seq, T item)
+	public bool Offer(uint seq, T item) => Offer(seq, item, 0);
+
+	public bool Offer(uint seq, T item, long nowMs)
 	{
 		lock (_sync)
 		{
@@ -71,6 +74,7 @@ public sealed class LifecycleSequencer<T>
 					_ready.Enqueue((_next, value));
 					_next++;
 				}
+				_gapSinceMs = nowMs;
 				return true;
 			}
 			if (_early.Count >= MaxBuffered)
@@ -78,8 +82,19 @@ public sealed class LifecycleSequencer<T>
 				Overflow++;
 				return false;
 			}
+			if (_early.Count == 0) _gapSinceMs = nowMs;
 			_early[seq] = item;
 			return true;
+		}
+	}
+
+	/// <summary>A missing offered sequence, not time spent applying an already contiguous ready queue.</summary>
+	public bool TryGetExpiredGap(long nowMs, long timeoutMs, out uint sequence)
+	{
+		lock (_sync)
+		{
+			sequence = _next;
+			return _early.Count > 0 && nowMs - _gapSinceMs >= timeoutMs;
 		}
 	}
 

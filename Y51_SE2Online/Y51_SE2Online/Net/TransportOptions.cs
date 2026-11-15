@@ -8,6 +8,12 @@ public sealed class TransportOptions
 
 	public int BulkHighWaterLanesBytes = 1048576;
 
+	/// <summary>Managed Control backlog, including requests awaiting Poll. Exhaustion retires the connection.</summary>
+	public int MaxQueuedControlBytes = 16777216;
+
+	/// <summary>Bounds empty/tiny messages too; byte capacity also permits two maximum-size bulk messages.</summary>
+	public int MaxQueuedSendMessages = 65536;
+
 	public int MaxBulkMessageBytes = 268435456;
 
 	/// <summary>

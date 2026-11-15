@@ -244,6 +244,17 @@ public sealed class ClientSession
 	public bool HasSnapshot => Volatile.Read(in _snapshot) != null;
 
 	public bool LeftOnPurpose { get; private set; }
+	private int _connectionFailureRequested;
+	internal bool ConnectionFailureRequested => Volatile.Read(ref _connectionFailureRequested) != 0;
+
+	/// <summary>Retires an unusable stream as a lost connection; the normal optional rejoin policy handles it.</summary>
+	internal void FailConnection(string reason)
+	{
+		if (_detached || Host is not PeerId host || CurrentPhase is Phase.Rejected or Phase.Disconnected ||
+			Interlocked.Exchange(ref _connectionFailureRequested, 1) != 0) return;
+		_log.Warn("sync(client): " + reason + "; closing the connection");
+		_t.Disconnect(host, DisconnectCodes.ProtocolError, reason);
+	}
 
 	public event Action? SnapshotReady;
 
